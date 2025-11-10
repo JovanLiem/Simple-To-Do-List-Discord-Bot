@@ -14,6 +14,9 @@ import yt_dlp
 from collections import deque
 from discord import app_commands
 from io import BytesIO
+import io
+import openpyxl
+from openpyxl.styles import Font, Alignment
 from openpyxl import Workbook
 from openpyxl.styles import Border, Side
 import pytz
@@ -691,6 +694,99 @@ async def riwayat_absensi(interaction: discord.Interaction):
         msg += f"📅 {checkin_str} → {checkout_str} | ⏱️ {durasi}\n"
 
     await interaction.response.send_message(msg)
+    
+@app_commands.describe(
+    start_date="Tanggal mulai (format: YYYY-MM-DD, opsional)",
+    end_date="Tanggal akhir (format: YYYY-MM-DD, opsional)"
+)
+@bot.tree.command(name="export_absensi", description="Ekspor absensi kamu ke file Excel (bisa filter tanggal).")
+async def export_absensi(interaction: discord.Interaction, start_date: str = None, end_date: str = None):
+    await interaction.response.defer(thinking=True)
+
+    conn = await asyncpg.connect(DATABASE_URL)
+    user_id = interaction.user.id
+    username = interaction.user.name
+    guild_id = interaction.guild_id
+    wib = pytz.timezone("Asia/Jakarta")
+
+    # 🔧 Parsing tanggal (jika ada)
+    try:
+        start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=wib) if start_date else None
+        end = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=wib) + timedelta(days=1) if end_date else None
+    except ValueError:
+        await interaction.followup.send("⚠️ Format tanggal salah. Gunakan format: YYYY-MM-DD.")
+        await conn.close()
+        return
+
+    # 🔍 Query dengan filter tanggal
+    query = """
+        SELECT 
+            checkin_time AT TIME ZONE 'Asia/Jakarta' AS checkin,
+            checkout_time AT TIME ZONE 'Asia/Jakarta' AS checkout,
+            work_duration
+        FROM attendance
+        WHERE user_id = $1 AND guild_id = $2
+    """
+    params = [user_id, guild_id]
+
+    if start and end:
+        query += " AND checkin_time BETWEEN $3 AND $4"
+        params += [start, end]
+    elif start:
+        query += " AND checkin_time >= $3"
+        params.append(start)
+    elif end:
+        query += " AND checkin_time < $3"
+        params.append(end)
+
+    query += " ORDER BY checkin_time DESC"
+
+    rows = await conn.fetch(query, *params)
+    await conn.close()
+
+    if not rows:
+        await interaction.followup.send("📭 Tidak ada data absensi untuk periode tersebut.")
+        return
+
+    # 📊 Buat workbook Excel
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = f"Absensi {username}"
+
+    headers = ["No", "Tanggal", "Check-in (WIB)", "Checkout (WIB)", "Durasi"]
+    ws.append(headers)
+
+    for cell in ws[1]:
+        cell.font = Font(bold=True)
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+
+    for i, r in enumerate(rows, start=1):
+        tanggal = r["checkin"].strftime("%Y-%m-%d") if r["checkin"] else "-"
+        checkin = r["checkin"].strftime("%H:%M:%S") if r["checkin"] else "-"
+        checkout = r["checkout"].strftime("%H:%M:%S") if r["checkout"] else "-"
+        durasi = str(r["work_duration"]).split(".")[0] if r["work_duration"] else "-"
+
+        ws.append([i, tanggal, checkin, checkout, durasi])
+
+    for column_cells in ws.columns:
+        max_length = max(len(str(cell.value)) if cell.value else 0 for cell in column_cells)
+        ws.column_dimensions[column_cells[0].column_letter].width = max_length + 2
+
+    # 📁 Simpan ke buffer memory
+    buffer = io.BytesIO()
+    wb.save(buffer)
+    buffer.seek(0)
+
+    # 🗓️ Nama file otomatis
+    filename = f"absensi_{username}_{datetime.now(WIB).strftime('%Y%m%d_%H%M%S')}.xlsx"
+
+    file = discord.File(buffer, filename=filename)
+    await interaction.followup.send(
+        content=f"📊 Berikut hasil ekspor absensi kamu ({username})"
+                + (f" dari {start_date} sampai {end_date}" if start_date or end_date else "")
+                + ":",
+        file=file
+    )
 
 @bot.command()
 @commands.is_owner()
