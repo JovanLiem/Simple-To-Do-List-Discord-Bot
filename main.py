@@ -20,6 +20,8 @@ from openpyxl.styles import Font, Alignment
 from openpyxl import Workbook
 from openpyxl.styles import Border, Side
 import pytz
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.date import DateTrigger
 
 # =====================================================
 # FFMPEG AUTO-INSTALLER (tetap sama)
@@ -75,6 +77,7 @@ WIB = ZoneInfo("Asia/Jakarta")
 intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
+scheduler = AsyncIOScheduler(timezone="Asia/Jakarta")
 
 # GLOBAL QUEUE — PASTIKAN SELALU deque!
 SONG_QUEUES = {}  # str(guild_id) -> deque
@@ -119,17 +122,16 @@ async def init_db():
             work_duration INTERVAL
         );
     """)
+    await conn.execute("""
+        CREATE TABLE IF NOT EXISTS reminders (
+            id SERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL,
+            channel_id BIGINT NOT NULL,
+            message TEXT NOT NULL,
+            send_time TIMESTAMPTZ NOT NULL
+        );
+    """)
     await conn.close()
-
-@bot.event
-async def on_ready():
-    print(f"Logged in as {bot.user.name}")
-    await init_db()
-    try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} slash command(s)")
-    except Exception as e:
-        print(f"Failed to sync commands: {e}")
 
 # =====================================================
 # SAFE QUEUE HELPER
@@ -787,6 +789,68 @@ async def export_absensi(interaction: discord.Interaction, start_date: str = Non
                 + ":",
         file=file
     )
+    
+# ---------- Fungsi kirim pesan ----------
+async def send_reminder(reminder_id):
+    conn = await get_db()
+    reminder = await conn.fetchrow("SELECT * FROM reminders WHERE id=$1;", reminder_id)
+    await conn.close()
+    if reminder:
+        channel = bot.get_channel(reminder["channel_id"])
+        if channel:
+            user_mention = f"<@{reminder['user_id']}>"
+            await channel.send(f"🔔 {user_mention} Reminder: {reminder['message']}")
+        # (Opsional) hapus dari DB setelah dikirim
+        conn = await get_db()
+        await conn.execute("DELETE FROM reminders WHERE id=$1;", reminder_id)
+        await conn.close()
+        
+# ---------- Fungsi kirim pesan ----------
+async def send_reminder(reminder_id):
+    conn = await get_db()
+    reminder = await conn.fetchrow("SELECT * FROM reminders WHERE id=$1;", reminder_id)
+    await conn.close()
+    if reminder:
+        channel = bot.get_channel(reminder["channel_id"])
+        if channel:
+            user_mention = f"<@{reminder['user_id']}>"
+            await channel.send(f"🔔 {user_mention} Reminder: {reminder['message']}")
+        # (Opsional) hapus dari DB setelah dikirim
+        conn = await get_db()
+        await conn.execute("DELETE FROM reminders WHERE id=$1;", reminder_id)
+        await conn.close()
+
+
+# ---------- Command untuk menambah reminder ----------
+@bot.tree.command(name="reminder", description="Buat pengingat dengan waktu tertentu")
+@app_commands.describe(
+    message="Pesan yang akan dikirim",
+    tanggal="Tanggal (format: YYYY-MM-DD)",
+    jam="Jam (format: HH:MM, 24 jam)"
+)
+async def reminder(interaction: discord.Interaction, message: str, tanggal: str, jam: str):
+    try:
+        tz = pytz.timezone("Asia/Jakarta")
+        waktu = tz.localize(datetime.strptime(f"{tanggal} {jam}", "%Y-%m-%d %H:%M"))
+
+        if waktu <= datetime.now(tz):
+            await interaction.response.send_message("❌ Waktu sudah lewat!", ephemeral=True)
+            return
+
+        conn = await get_db()
+        row = await conn.fetchrow("""
+            INSERT INTO reminders (user_id, channel_id, message, send_time)
+            VALUES ($1, $2, $3, $4)
+            RETURNING id;
+        """, interaction.user.id, interaction.channel_id, message, waktu)
+        await conn.close()
+
+        reminder_id = row["id"]
+        scheduler.add_job(send_reminder, trigger=DateTrigger(run_date=waktu), args=[reminder_id])
+        await interaction.response.send_message(f"✅ Reminder dibuat untuk {waktu.strftime('%Y-%m-%d %H:%M:%S')} WIB!")
+
+    except Exception as e:
+        await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
 
 @bot.command()
 @commands.is_owner()
@@ -794,6 +858,44 @@ async def restart(ctx):
     await ctx.send("Bot akan restart...")
     await bot.close()
     os.execv(sys.executable, ['python'] + sys.argv)
+
+@bot.event
+async def on_ready():
+    print(f"✅ Logged in as {bot.user.name}")
+    await init_db()
+
+    # Sinkronisasi command ke Discord
+    try:
+        synced = await bot.tree.sync()
+        print(f"🪄 Synced {len(synced)} slash command(s).")
+    except Exception as e:
+        print(f"❌ Failed to sync commands: {e}")
+
+    # Muat ulang reminder yang belum dikirim dari database
+    conn = await get_db()
+    rows = await conn.fetch("SELECT id, send_time FROM reminders;")
+    await conn.close()
+
+    now = datetime.now(pytz.timezone("Asia/Jakarta"))
+    count_scheduled = 0
+    count_sent_late = 0
+
+    for r in rows:
+        send_time = r["send_time"]
+        if send_time <= now:
+            # Kalau waktu sudah lewat, kirim langsung
+            await send_reminder(r["id"])
+            count_sent_late += 1
+        else:
+            # Kalau belum lewat, jadwalkan
+            scheduler.add_job(send_reminder, trigger=DateTrigger(run_date=send_time), args=[r["id"]])
+            count_scheduled += 1
+
+    # Jalankan scheduler
+    if not scheduler.running:
+        scheduler.start()
+
+    print(f"📅 Scheduler aktif — {count_scheduled} reminder dijadwalkan, {count_sent_late} dikirim karena terlambat.")
 
 # =====================================================
 # RUN BOT
