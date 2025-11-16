@@ -1,0 +1,9 @@
+discord.py
+yt-dlp
+asyncpg
+python-dotenv
+PyNaCl
+openpyxl
+pytz
+apscheduler
+aiomysql
