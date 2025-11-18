@@ -3,7 +3,7 @@ import asyncio
 import aiomysql
 import subprocess
 import platform
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from zoneinfo import ZoneInfo
 from discord.ext import commands, tasks
 import discord
@@ -613,22 +613,12 @@ async def checkin(interaction: discord.Interaction):
     user_id = interaction.user.id
     username = interaction.user.name
     guild_id = interaction.guild_id
-    wib = pytz.timezone("Asia/Jakarta")
-    now_wib = datetime.now(wib)
 
-    async with conn.cursor(aiomysql.DictCursor) as cursor:
-        await cursor.execute("""
-            SELECT id FROM attendance
-            WHERE user_id = %s AND guild_id = %s
-            AND DATE(CONVERT_TZ(checkin_time, '+00:00', '+07:00')) = CURDATE()
-        """, (user_id, guild_id))
-        record = await cursor.fetchone()
+    # WIB langsung
+    WIB = timezone(timedelta(hours=7))
+    now_wib = datetime.now(WIB).replace(tzinfo=None)  # simpan tanpa tzinfo agar bentuk DATETIME normal
 
-    if record:
-        await interaction.response.send_message("⚠️ Kamu sudah check-in hari ini!")
-        release_db(conn)
-        return
-
+    # Simpan WIB langsung ke DB
     async with conn.cursor() as cursor:
         await cursor.execute("""
             INSERT INTO attendance (user_id, username, guild_id, checkin_time)
@@ -647,17 +637,27 @@ async def checkout(interaction: discord.Interaction):
 
     user_id = interaction.user.id
     guild_id = interaction.guild_id
-    wib = pytz.timezone("Asia/Jakarta")
-    now_wib = datetime.now(wib)
 
+    WIB = timezone(timedelta(hours=7))
+    now_wib = datetime.now(WIB).replace(tzinfo=None)  # untuk disimpan & display
+
+    # Range hari WIB (00:00 - 23:59 WIB)
+    today_start = datetime.now(WIB).replace(hour=0, minute=0, second=0, microsecond=0)
+    today_end = today_start + timedelta(days=1)
+
+    # Buang timezone agar cocok dengan DATETIME MySQL
+    today_start = today_start.replace(tzinfo=None)
+    today_end = today_end.replace(tzinfo=None)
+
+    # Cari check-in hari ini
     async with conn.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute("""
             SELECT id, checkin_time, checkout_time
             FROM attendance
             WHERE user_id = %s AND guild_id = %s
-            AND DATE(CONVERT_TZ(checkin_time, '+00:00', '+07:00')) = CURDATE()
+            AND checkin_time >= %s AND checkin_time < %s
             ORDER BY checkin_time DESC LIMIT 1
-        """, (user_id, guild_id))
+        """, (user_id, guild_id, today_start, today_end))
         record = await cursor.fetchone()
 
     if not record:
@@ -670,13 +670,15 @@ async def checkout(interaction: discord.Interaction):
         release_db(conn)
         return
 
-    checkin_time = record["checkin_time"].replace(tzinfo=pytz.UTC).astimezone(wib)
-    work_duration = now_wib - checkin_time
+    # Hitung durasi kerja dalam WIB
+    checkin_wib = record["checkin_time"]
+    work_duration = now_wib - checkin_wib
 
     hours, remainder = divmod(work_duration.total_seconds(), 3600)
     minutes, seconds = divmod(remainder, 60)
     duration_str = f"{int(hours):02d}:{int(minutes):02d}:{int(seconds):02d}"
 
+    # Update checkout WIB ke DB
     async with conn.cursor() as cursor:
         await cursor.execute("""
             UPDATE attendance
@@ -695,13 +697,12 @@ async def checkout(interaction: discord.Interaction):
 async def riwayat_absensi(interaction: discord.Interaction):
     conn = await get_db()
     user_id = interaction.user.id
-    wib = pytz.timezone("Asia/Jakarta")
 
     async with conn.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute("""
             SELECT 
-                CONVERT_TZ(checkin_time, '+00:00', '+07:00') AS checkin,
-                CONVERT_TZ(checkout_time, '+00:00', '+07:00') AS checkout,
+                checkin_time AS checkin,
+                checkout_time AS checkout,
                 work_duration
             FROM attendance
             WHERE user_id = %s
@@ -709,21 +710,23 @@ async def riwayat_absensi(interaction: discord.Interaction):
             LIMIT 5
         """, (user_id,))
         rows = await cursor.fetchall()
+
     release_db(conn)
 
     if not rows:
         await interaction.response.send_message("📭 Kamu belum punya riwayat absensi.")
         return
 
-    msg = "**🗓️ Riwayat Absensi Terakhir:**\n"
+    msg = "**🗓️ Riwayat Absensi 5 Hari Terakhir:**\n"
     for r in rows:
-        checkin_str = r["checkin"].strftime("%Y-%m-%d %H:%M:%S") if r["checkin"] else "-"
-        checkout_str = r["checkout"].strftime("%Y-%m-%d %H:%M:%S") if r["checkout"] else "-"
-        durasi = str(r["work_duration"]) if r["work_duration"] else "-"
-        msg += f"📅 {checkin_str} → {checkout_str} | ⏱️ {durasi}\n"
+        checkin = r["checkin"].strftime("%Y-%m-%d %H:%M:%S") if r["checkin"] else "-"
+        checkout = r["checkout"].strftime("%Y-%m-%d %H:%M:%S") if r["checkout"] else "-"
+        durasi = r["work_duration"] if r["work_duration"] else "-"
+
+        msg += f"📅 {checkin} → {checkout} | ⏱️ {durasi}\n"
 
     await interaction.response.send_message(msg)
-
+    
 @app_commands.describe(
     start_date="Tanggal mulai (format: YYYY-MM-DD, opsional)",
     end_date="Tanggal akhir (format: YYYY-MM-DD, opsional)"
@@ -736,26 +739,28 @@ async def export_absensi(interaction: discord.Interaction, start_date: str = Non
     user_id = interaction.user.id
     username = interaction.user.name
     guild_id = interaction.guild_id
-    wib = pytz.timezone("Asia/Jakarta")
 
+    # --- Parse tanggal (langsung sebagai WIB) ---
     try:
-        start = datetime.strptime(start_date, "%Y-%m-%d").replace(tzinfo=wib) if start_date else None
-        end = datetime.strptime(end_date, "%Y-%m-%d").replace(tzinfo=wib) + timedelta(days=1) if end_date else None
+        start = datetime.strptime(start_date, "%Y-%m-%d") if start_date else None
+        end = (datetime.strptime(end_date, "%Y-%m-%d") + timedelta(days=1)) if end_date else None
     except ValueError:
         await interaction.followup.send("⚠️ Format tanggal salah. Gunakan format: YYYY-MM-DD.")
         release_db(conn)
         return
 
+    # --- Query tanpa CONVERT_TZ ---
     query = """
         SELECT 
-            CONVERT_TZ(checkin_time, '+00:00', '+07:00') AS checkin,
-            CONVERT_TZ(checkout_time, '+00:00', '+07:00') AS checkout,
+            checkin_time AS checkin,
+            checkout_time AS checkout,
             work_duration
         FROM attendance
         WHERE user_id = %s AND guild_id = %s
     """
     params = [user_id, guild_id]
 
+    # --- Filter jika ada tanggal ---
     if start and end:
         query += " AND checkin_time BETWEEN %s AND %s"
         params += [start, end]
@@ -768,26 +773,30 @@ async def export_absensi(interaction: discord.Interaction, start_date: str = Non
 
     query += " ORDER BY checkin_time DESC"
 
+    # --- Ambil data ---
     async with conn.cursor(aiomysql.DictCursor) as cursor:
         await cursor.execute(query, params)
         rows = await cursor.fetchall()
+
     release_db(conn)
 
     if not rows:
         await interaction.followup.send("📭 Tidak ada data absensi untuk periode tersebut.")
         return
 
+    # --- Buat file Excel ---
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = f"Absensi {username}"
 
-    headers = ["No", "Tanggal", "Check-in (WIB)", "Checkout (WIB)", "Durasi"]
+    headers = ["No", "Tanggal", "Check-in", "Checkout", "Durasi"]
     ws.append(headers)
 
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
+    # --- Isi data ---
     for i, r in enumerate(rows, start=1):
         tanggal = r["checkin"].strftime("%Y-%m-%d") if r["checkin"] else "-"
         checkin = r["checkin"].strftime("%H:%M:%S") if r["checkin"] else "-"
@@ -796,22 +805,23 @@ async def export_absensi(interaction: discord.Interaction, start_date: str = Non
 
         ws.append([i, tanggal, checkin, checkout, durasi])
 
+    # --- Auto width ---
     for column_cells in ws.columns:
         max_length = max(len(str(cell.value)) if cell.value else 0 for cell in column_cells)
         ws.column_dimensions[column_cells[0].column_letter].width = max_length + 2
 
+    # --- Kirim file ---
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
 
-    filename = f"absensi_{username}_{datetime.now(WIB).strftime('%Y%m%d_%H%M%S')}.xlsx"
+    filename = f"absensi_{username}_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
 
-    file = discord.File(buffer, filename=filename)
     await interaction.followup.send(
         content=f"📊 Berikut hasil ekspor absensi kamu ({username})"
                 + (f" dari {start_date} sampai {end_date}" if start_date or end_date else "")
                 + ":",
-        file=file
+        file=discord.File(buffer, filename=filename)
     )
 
 # =====================================================
